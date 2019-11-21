@@ -1,298 +1,292 @@
 #pragma once
-#include <utility>
-#include <optional>
 #include "span.h"
-#include <memory>
+#include "slice.h"
+#include "StackAllocator.h"
+#include <cassert>
+#include <type_traits>
+#include <vector>
+#include <algorithm>
 
 #define PROVIDE_CONTAINER_TYPES(T) \
-	using value_type = T;\
-	using pointer = T * ;\
-	using const_pointer = const T *;\
-	using reference = T & ;\
-	using const_reference = const T &; \
-	using size_type = std::size_t; \
-	using difference_type = std::ptrdiff_t
-  
-struct no_init_t {};
-constexpr no_init_t no_init;
+	using value_type = typename T::value_type;\
+	using pointer = typename T::pointer;\
+	using const_pointer = typename T::const_pointer;\
+	using reference = typename T::reference;\
+	using const_reference = typename T::const_reference; \
+	using size_type = typename T::size_type; \
+	using difference_type = typename T::difference_type
 
-class ring_buffer_index
-	{
-		size_t index;
+namespace LIB_NAMESPACE
+{
+	template <class T, class Allocator>
+	class ring_buffer;
 
-	public:
-
-		ring_buffer_index() : index{0} {}
-
-		ring_buffer_index(size_t pos) : index{pos} {}
-
-		ring_buffer_index& operator++()
-		{
-			++index;
-			return *this;
-		}
-
-		ring_buffer_index& operator--()
-		{
-			--index;
-			return *this;
-		}
-
-		ring_buffer_index operator+(size_t pos) const { return ring_buffer_index{index + pos}; }
-
-		size_t operator-(ring_buffer_index other) const { return index - other.index; }
-
-		bool operator==(ring_buffer_index other) const { return index == other.index; }
-
-		bool operator!=(ring_buffer_index other) const { return index != other.index; }
-
-		void operator+=(size_t times) { index += times; }
-
-		void operator-=(size_t times) { index -= times; }
-
-		void reset() { index = 0; }
-
-		size_t as_index(size_t N) const
-		{
-			size_t pos = index;
-			pos %= N;
-			return pos;
-		}
-		
-	};
-
-	template <class T>
-	class uninitialized_array
-	{
-		std::unique_ptr<unsigned char> raw_buffer;
-
-	public:
-
-		uninitialized_array() noexcept = default;
-
-		uninitialized_array(size_t N) : raw_buffer{ new unsigned char[sizeof(T) * N] } {}
-
-		uninitialized_array(uninitialized_array&& other) noexcept = default;
-
-		uninitialized_array& operator=(uninitialized_array&& other) noexcept = default;
-
-		void copy(const uninitialized_array& other, size_t N)
-		{
-			raw_buffer.reset();
-			if (other.raw_buffer && N)
-			{
-				raw_buffer.reset(new unsigned char[sizeof(T) * N]);
-				std::uninitialized_copy(other.ptr(), other.ptr() + N, ptr());
-			}
-		}
-
-		void resize(size_t N)
-		{
-			raw_buffer.reset( new unsigned char[sizeof(T) * N] );
-		}
-
-		T * ptr() noexcept { return reinterpret_cast<T*>(raw_buffer.get()); }
-
-		const T * ptr() const noexcept { return reinterpret_cast<const T*>(raw_buffer.get()); }
-
-		T& operator[](size_t pos) noexcept
-		{
-			return ptr()[pos];
-		}
-
-	};
-
-	template <class T, bool reverse = false, bool const_iter = false>
+	template <class T, class Allocator, bool is_const>
 	class ring_buffer_iterator
 	{
-		T *ptr;
-		ring_buffer_index index;
-		size_t N;
-	
+		using rbf_type = std::conditional_t<is_const, const ring_buffer<T, Allocator>, ring_buffer<T, Allocator>>;
+		using rbf_ptr_type = rbf_type *;
+		rbf_ptr_type rbf_ptr;
+		mutable T *ptr;
+
 	public:
 
-		PROVIDE_CONTAINER_TYPES(T);
-		
+		PROVIDE_CONTAINER_TYPES(rbf_type);
 		using iterator_category = std::random_access_iterator_tag;
 
-		ring_buffer_iterator(T *ptr, ring_buffer_index index, size_t N) : ptr{ ptr }, index{ index }, N{ N } {}
-		
-		ring_buffer_iterator& operator++()
+		ring_buffer_iterator() noexcept : rbf_ptr{ nullptr }, ptr{ nullptr } {}
+
+		ring_buffer_iterator(rbf_ptr_type ring_buffer_ptr, pointer ptr) noexcept : rbf_ptr{ ring_buffer_ptr }, ptr{ ptr } {}
+
+		std::conditional_t<is_const, const_reference, reference> operator*() const noexcept;
+
+		std::conditional_t<is_const, const_pointer, pointer> operator->() const noexcept { return &(this->operator*()); }
+
+		ring_buffer_iterator& operator++() noexcept;
+
+		ring_buffer_iterator& operator--() noexcept;
+
+		ring_buffer_iterator operator++(int) noexcept
 		{
-			if constexpr (!reverse)
-				++index;
-			else
-				--index;
-			return *this;
+			auto saved_it{ *this };
+			++(*this);
+			return saved_it;
 		}
 
-		ring_buffer_iterator& operator+=(size_t n) { index += n; return *this; }
-
-		ring_buffer_iterator& operator-=(size_t n) { return operator+=(-n); }
-
-		template <bool citer = const_iter, std::enable_if_t<!citer, bool> = true> 
-		reference operator*() const
+		ring_buffer_iterator operator--(int) noexcept
 		{
-			return ptr[index.as_index(N)];
+			auto saved_it{ *this };
+			--(*this);
+			return saved_it;
 		}
 
-		template <bool citer = const_iter, std::enable_if_t<citer, bool> = true>
-		const_reference operator*() const
+		ring_buffer_iterator& operator +=(difference_type n) noexcept;
+
+		ring_buffer_iterator& operator -=(difference_type n) noexcept;
+
+		friend ring_buffer_iterator operator+(const ring_buffer_iterator& iter, difference_type n) noexcept
 		{
-			return ptr[index.as_index(N)];
+			ring_buffer_iterator it{ iter };
+			it += n;
+			return it;
 		}
 
-		template <bool citer = const_iter, std::enable_if_t<!citer, bool> = true>
-		reference operator[](difference_type n) { return *(*this + n); }
+		friend ring_buffer_iterator operator+(difference_type n, const ring_buffer_iterator& iter) noexcept
+		{
+			ring_buffer_iterator it{ iter };
+			it += n;
+			return it;
+		}
 
-		const_reference operator[](difference_type n) const { return *(*this + n); }
+		ring_buffer_iterator operator-(difference_type n) const noexcept { return (*this + (-n)); }
 
-		bool operator!=(ring_buffer_iterator other) const { return index != other.index; }
+		difference_type operator-(const ring_buffer_iterator& other) const noexcept;
 
-		bool operator==(ring_buffer_iterator other) const { return index == other.index; }
+		template <bool const_iter = is_const, std::enable_if_t<!const_iter, bool> = true>
+		reference operator[](difference_type n) const noexcept { return *(*this + n); }
 
-		friend ring_buffer_iterator operator+(const ring_buffer_iterator& iter, size_t times) { return ring_buffer_iterator{iter.ptr, iter.index + times, iter.N}; }
+		template <bool const_iter = is_const, std::enable_if_t<const_iter, bool> = true>
+		const_reference operator[](difference_type n) const noexcept { return *(*this + n); }
 
-		friend ring_buffer_iterator operator+(size_t times, const ring_buffer_iterator& iter) { return ring_buffer_iterator{ iter.ptr, iter.index + times, iter.N }; }
+		friend constexpr bool operator==(const ring_buffer_iterator& lhs, const ring_buffer_iterator& rhs) noexcept { return lhs.ptr == rhs.ptr; }
 
-		friend ring_buffer_iterator operator-(const ring_buffer_iterator& lhs, size_t times) { return ring_buffer_iterator{lhs.ptr, lhs.index - times, lhs.N}; }
-
-		friend difference_type operator-(const ring_buffer_iterator& lhs, const ring_buffer_iterator& rhs) { return static_cast<difference_type>(lhs.index - rhs.index); }
+		friend constexpr bool operator!=(const ring_buffer_iterator& lhs, const ring_buffer_iterator& rhs) noexcept { return lhs.ptr != rhs.ptr; }
 
 	};
 
-	template <class T>
-	class ring_buffer
+	template <class T, class Allocator = std::allocator<T>>
+	class ring_buffer : private Allocator
 	{
-		size_t N;
-		mutable uninitialized_array<T> raw_buffer;
-		ring_buffer_index read_pos, write_pos;
-
-		T& read_ptr() const
-		{
-			return raw_buffer[read_pos.as_index(N)];
-		}
-
-		T& write_ptr() const
-		{
-			return raw_buffer[write_pos.as_index(N)];
-		}
-
-		bool will_remain_linearized(size_t num)
-		{
-			ring_buffer_index last_elem = write_pos + num - 1;
-			return last_elem.as_index(N) >= read_pos.as_index(N);
-		}
+		using alloc_traits = typename std::allocator_traits<Allocator>;
 
 	public:
 
-		PROVIDE_CONTAINER_TYPES(T);
+		using allocator_type = Allocator;
+		using value_type = typename alloc_traits::value_type;
+		using pointer = typename alloc_traits::pointer;
+		using const_pointer = typename alloc_traits::const_pointer;
+		using reference = T & ;
+		using const_reference = const T&;
+		using size_type = typename alloc_traits::size_type;
+		using difference_type = typename alloc_traits::difference_type;
 
-		using iterator = ring_buffer_iterator<T>;
-		using const_iterator = ring_buffer_iterator<T, false, true>;
-		using reverse_iterator = ring_buffer_iterator<T, true>;
-		using const_reverse_iterator = const ring_buffer_iterator<T, true, true>;
+		using iterator = ring_buffer_iterator<value_type, Allocator, false>;
+		using const_iterator = ring_buffer_iterator < value_type, Allocator, true>;
+		using reverse_iterator = std::reverse_iterator<iterator>;
+		using const_reverse_iterator = std::reverse_iterator<const_iterator>;
 
-		/*
-		contrtuctors and assignment operators
-		*/
+		ring_buffer() noexcept : buffer_start{ nullptr } {}
 
-		ring_buffer() : N{0} {}
+		explicit ring_buffer(const allocator_type& alloc) : allocator_type(alloc), buffer_start{ nullptr } { }
 
-		ring_buffer(size_t size) : N{ size }, raw_buffer { size } {}
-
-		ring_buffer(ring_buffer&&) noexcept = default;
-
-		ring_buffer(const ring_buffer& other)
+		ring_buffer(size_type capacity_size) : buffer_start{ AllocMem(capacity_size) },
+			buffer_end{ buffer_start + capacity_size }, front_ptr{ buffer_start }, back_ptr{ buffer_start }, count{ 0 }
 		{
-			clear();
-			N = other.N;
-			read_pos = other.read_pos;
-			write_pos = other.write_pos;
-			raw_buffer.copy(other.raw_buffer, N);
+			assert(buffer_start != nullptr && "the ring buffer couldn't allocate memory");
 		}
 
-		ring_buffer(std::initializer_list<value_type> init) : ring_buffer(init.size())
+		ring_buffer(size_type capacity_size, const allocator_type& alloc) : allocator_type(alloc),
+			buffer_start{ AllocMem(capacity_size) }, buffer_end{ buffer_start + capacity_size }, front_ptr{ buffer_start }, back_ptr{ buffer_start }, count{ 0 }
 		{
-			std::uninitialized_copy(init.begin(), init.end(), raw_buffer.ptr());
+			assert(buffer_start != nullptr && "the ring buffer couldn't allocate memory");
+		}
+
+		ring_buffer(size_type capacity_size_and_count, const value_type& value) :
+			buffer_start{ AllocMem(capacity_size_and_count) }, buffer_end{ buffer_start + capacity_size_and_count },
+			front_ptr{ buffer_start }, back_ptr{ buffer_start }, count{ capacity_size_and_count }
+		{
+			assert(capacity_size_and_count > 0 && "invalid capacity");
+			assert(buffer_start != nullptr && "the ring buffer couldn't allocate memory");
+			std::uninitialized_fill(front_ptr, front_ptr + size(), value);
+		}
+
+		ring_buffer(size_type capacity_size_and_count, const value_type& value, const allocator_type& alloc) : allocator_type(alloc),
+			buffer_start{ AllocMem(capacity_size_and_count) }, buffer_end{ buffer_start + capacity_size_and_count },
+			front_ptr{ buffer_start }, back_ptr{ buffer_end }, count{ capacity_size_and_count }
+		{
+			assert(capacity_size_and_count > 0 && "invalid capacity");
+			assert(buffer_start != nullptr && "the ring buffer couldn't allocate memory");
+			std::uninitialized_fill(front_ptr, front_ptr + size(), value);
+		}
+
+		ring_buffer(size_type capacity_size, size_type buffer_size, const value_type& value) : buffer_start{ AllocMem(capacity_size) },
+			buffer_end{ buffer_start + capacity_size }, front_ptr{ buffer_start }, back_ptr{ buffer_start + buffer_size }, count{ buffer_size }
+		{
+			assert(capacity_size >= buffer_size && "ring buffer size can't be greater than capacity");
+			assert(buffer_start != nullptr && "the ring buffer couldn't allocate memory");
+			if (back_ptr == buffer_end)
+				back_ptr = buffer_start;
+			std::uninitialized_fill(front_ptr, front_ptr + size, value);
+		}
+
+		ring_buffer(size_type capacity_size, size_type buffer_size, const value_type& value, const allocator_type& alloc) : allocator_type(alloc),
+			buffer_start{ AllocMem(capacity_size) },
+			buffer_end{ buffer_start + capacity_size }, front_ptr{ buffer_start }, back_ptr{ buffer_start + buffer_size }, count{ buffer_size }
+		{
+			assert(capacity_size >= buffer_size && "ring buffer size can't be greater than capacity");
+			assert(buffer_start != nullptr && "the ring buffer couldn't allocate memory");
+			std::uninitialized_fill(front_ptr, front_ptr + size(), value);
 		}
 
 		template <class InputIterator>
-		ring_buffer(InputIterator first, InputIterator last) : ring_buffer(static_cast<size_type>(std::distance(first, last)))
+		ring_buffer(InputIterator first, InputIterator last) : ring_buffer(udistance(first, last))
 		{
-			std::uninitialized_copy(first, last, raw_buffer.ptr());
-			write_pos += capacity();
+			std::uninitialized_copy(first, last, front_ptr);
+			count = capacity();
 		}
 
-		ring_buffer& operator=(ring_buffer&& other) noexcept
+		template <class InputIterator>
+		ring_buffer(InputIterator first, InputIterator last, const allocator_type& alloc) : ring_buffer(udistance(first, last), alloc)
 		{
-			clear();
-			N = other.N;
-			read_pos = other.read_pos;
-			write_pos = other.write_pos;
-			raw_buffer = std::move(other.raw_buffer);
-			return *this;
+			std::uninitialized_copy(first, last, front_ptr);
+			count = capacity();
+		}
 
+		ring_buffer(const ring_buffer& other) : count{ other.count }, buffer_start{ nullptr }
+		{
+			if (other.buffer_start)
+			{
+				size_type capacity_size = other.capacity();
+				buffer_start = AllocMem(capacity_size);
+				buffer_end = buffer_start + capacity_size;
+				front_ptr = buffer_start + (other.front_ptr - other.buffer_start);
+				back_ptr = buffer_start + (other.back_ptr - other.buffer_start);
+
+				if (is_linearized())
+					std::uninitialized_copy(other.front_ptr, other.back_ptr, front_ptr);
+				else
+				{
+					auto array1 = get_array<1, true>(false);
+					auto array2 = get_array<2, true>(false);
+					std::uninitialized_copy(array1.begin(), array1.end(), front_ptr);
+					std::uninitialized_copy(array2.begin(), array2.end(), buffer_start);
+				}
+			}
+		}
+
+		ring_buffer(ring_buffer&& other) noexcept : buffer_start{ other.buffer_start }, buffer_end{ other.buffer_end }, front_ptr{ other.front_ptr }
+			, back_ptr{ other.back_ptr }, count{ other.count }
+		{
+			other.buffer_start = nullptr;
+		}
+
+		~ring_buffer()
+		{
+			if (buffer_start)
+			{
+				DestroyAll();
+				FreeMem(buffer_start);
+			}
 		}
 
 		ring_buffer& operator=(const ring_buffer& other)
 		{
-			clear();
-			N = other.N;
-			read_pos = other.read_pos;
-			write_pos = other.write_pos;
-			raw_buffer.copy(other.raw_buffer, N);
+			this->~ring_buffer();
+			new (this) ring_buffer(other);
 			return *this;
 		}
 
-		~ring_buffer() { clear(); }
+		ring_buffer& operator=(ring_buffer&& other) noexcept
+		{
+			this->~ring_buffer();
+			new (this) ring_buffer(std::move(other));
+			return *this;
+		}
 
 		/*
-		addition methods
+		emplace, push and pop
+		for a FIFO order use emplace_back/push_back with pop_front
+		for a LIFP order use emplace_back/push_back with pop_back
 		*/
 
 		/*
-		add at the back of the buffer , this is usually used rather than add at the front
+		emplace_back and push_back
+
+		----------------------------------------------------------
+		| =>1 | 2 | 3 | 4 | 5 | => |  |  |  |  |  |  |  |  |  |  |
+		---^--------------------^---------------------------------
+		   ^                    ^
+		  front				   back
+
+		-----------------------------------------------------------
+		| =>1 | 2 | 3 | 4 | 5 | 6 | => |  |  |  |  |  |  |  |  |  |
+		---^------------------------^------------------------------
+		   ^					    ^
+		  front				      new back
 		*/
 
-		void push_back_without_checks(const value_type& value)
-		{
-			emplace_back_without_checks(value);
-		}
-
-		void push_back_without_checks(value_type&& value)
-		{
-			emplace_back_without_checks(std::move(value));
-		}
-
-		bool try_push_back(const value_type& value)
-		{
-			return try_emplace_back(value);
-		}
-
-		bool try_push_back(value_type&& value)
-		{
-			return try_emplace_back(std::move(value));
-		}
-
-		void push_back(const value_type& value)
-		{
-			emplace_back(value);
-		}
-
-		void push_back(value_type&& value)
-		{
-			emplace_back(std::move(value));
-		}
-
-		template <class ...Args>
+		template <class ... Args>
 		void emplace_back_without_checks(Args&& ... args)
 		{
-			new(&write_ptr()) T(std::forward<Args>(args)...);
-			++write_pos;
+			assert(buffer_start != nullptr && "void ring_buffer<T>::emplace_back_without_checks(Args&& ... args) the ring buffer has no capacity");
+			assert(!full() && "void ring_buffer<T>::emplace_back_without_checks(Args&& ... args) can't append to a full ring buffer without overwriting");
+#ifdef __cpp_exceptions
+			try
+			{
+				pointer current_back_ptr = back_ptr;
+				increment_back();
+				Construct(current_back_ptr, std::forward<Args>(args)...);
+			}
+			catch (...)
+			{
+				decrement_back();
+				throw;
+			}
+#else
+			new (back_ptr) T(std::forward<Args>(args)...);
+			increment_back();
+#endif // __cpp_exceptions
+			}
+
+		template <class ... Args>
+		void emplace_back(Args&& ... args)
+		{
+			if (full())
+				pop_front();
+			emplace_back_without_checks(std::forward<Args>(args)...);
 		}
 
-		template <class ...Args>
+		template <class ... Args>
 		bool try_emplace_back(Args&& ... args)
 		{
 			if (full())
@@ -301,105 +295,179 @@ class ring_buffer_index
 			return true;
 		}
 
-		template <class ...Args>
-		void emplace_back(Args&& ... args)
-		{
-			if (full())
-				pop_front();
-			emplace_back_without_checks(std::forward<Args>(args)...);
-		}
+		void push_back_without_checks(value_type&& value) { emplace_back_without_checks(std::move_if_noexcept(value)); }
 
-		template <class InputIterator>
-		void insert_back(InputIterator first, InputIterator last)
+		void push_back_without_checks(const value_type& value) { emplace_back_without_checks(value); }
+
+		void push_back(value_type&& value) { emplace_back(std::move_if_noexcept(value)); }
+
+		void push_back(const value_type& value) { emplace_back(value); }
+
+		bool try_push_back(value_type&& value) { return try_emplace_back(std::move_if_noexcept(value)); }
+
+		bool try_push_back(const value_type& value) { return try_emplace_back(value); }
+
+		template <class InputIter>
+		void insert_back(InputIter first, InputIter last)
 		{
-			size_t num = static_cast<size_t>(std::distance(first, last));
-			if (will_remain_linearized(num))
+			assert(buffer_start != nullptr && "void ring_buffer<T>::emplace_back_without_checks(Args&& ... args) the ring buffer has no capacity");
+
+			size_type range_size = udistance(first, last);
+			bool linearized = is_linearized();
+			size_type available_size = reserve();
+			size_type capacity_size = capacity();
+
+			if (available_size >= range_size)
 			{
-				std::uninitialized_copy(first, last, &write_ptr());
-				write_pos += num;
+				count += range_size;
+
+				if (front_ptr == buffer_start)
+				{
+					back_ptr = std::uninitialized_copy(first, last, back_ptr);
+					if (back_ptr == buffer_end)
+						back_ptr = buffer_start;
+				}
+				else if (back_ptr == buffer_start || !linearized)
+				{
+					back_ptr = std::uninitialized_copy(first, last, back_ptr);
+				}
+				else
+				{
+					auto end1 = first + std::min(range_size, (buffer_end - back_ptr));
+					back_ptr = std::uninitialized_copy(first, end1, back_ptr);
+					if (end1 != last)
+						back_ptr = std::uninitialized_copy(end1, last, buffer_start);
+					else if (back_ptr == buffer_end)
+						back_ptr = buffer_start;
+				}
 			}
+
+			else if (range_size < capacity_size)
+			{
+				count = capacity_size;
+
+				// fill the reverse then overwrite starting from front ptr
+
+				if (front_ptr == buffer_start)
+				{
+					/*
+					----------------------------------------------------
+					| >>1 | 2 | 3 | 4 | 5 | => |  |  |  |  |  |  |  |  |
+					----------------------------------------------------
+
+					*/
+
+					std::destroy(front_ptr, front_ptr + range_size - available_size);
+					auto end1 = first + available_size;
+					std::uninitialized_copy(first, end1, back_ptr);
+					front_ptr = back_ptr = std::uninitialized_copy(end1, last, buffer_start);
+				}
+				
+				else if (back_ptr == buffer_start)
+				{
+					/*
+					----------------------------------------------------
+					| => |  |  |  |  |  |  |  |  | >>1 | 2 | 3 | 4 | 5 |
+					----------------------------------------------------
+					*/
+
+					std::destroy(front_ptr, front_ptr + range_size - available_size);
+					front_ptr = back_ptr = std::uninitialized_copy(first, last, back_ptr);
+
+				}
+
+				else if (!linearized)
+				{
+					/*
+					----------------------------------------
+					| 4 | 5 | => |  |  |  |  | >>1 | 2 | 3 |
+					----------------------------------------
+					*/
+
+					size_type array1_size = buffer_end - front_ptr;
+					range_size -= available_size;
+					size_type to_copy = std::min(range_size, array1_size);
+					range_size -= to_copy;
+
+					std::destroy(front_ptr, front_ptr + to_copy);
+					auto end1 = first + available_size + to_copy;
+					back_ptr = front_ptr = std::uninitialized_copy(first, end1, back_ptr);
+
+					if (range_size)
+					{
+						std::destroy(buffer_start, buffer_start + range_size);
+						back_ptr = front_ptr = std::uninitialized_copy(end1, last, buffer_start);
+					}
+
+					else if (back_ptr == buffer_end)
+						back_ptr = front_ptr = buffer_start;
+				}
+				
+				else
+				{
+					/*
+					-------------------------------------------------
+					|  |  |  | >>1 | 2 | 3 | 4 | 5 | => |  |  |  |  |
+					-------------------------------------------------
+					*/
+
+					range_size -= available_size;
+					std::destroy(front_ptr, front_ptr + range_size);
+
+					auto end1 = first + (buffer_end - back_ptr);
+					std::uninitialized_copy(first, end1, back_ptr);
+					front_ptr = back_ptr = std::uninitialized_copy(end1, last, buffer_start);
+				}
+			}
+
 			else
-				std::copy(first, last, std::back_inserter(*this));
+			{
+				count = capacity_size;
+				DestroyAll();
+				first += range_size - capacity_size;
+				std::uninitialized_copy(first, last, buffer_start);
+				front_ptr = back_ptr = buffer_start;
+			}
+
 		}
 
 		/*
-		add at the front of the buffer
-		*/
-
-		void push_front_without_checks(const value_type& value)
-		{
-			emplace_front_without_checks(value);
-		}
-
-		void push_front_without_checks(value_type&& value)
-		{
-			emplace_front_without_checks(value);
-		}
-
-		bool try_push_front(const value_type& value)
-		{
-			return try_emplace_front(value);
-		}
-
-		bool try_push_front(value_type&& value)
-		{
-			return try_emplace_front(value);
-		}
-
-		void push_front(const value_type& value)
-		{
-			emplace_front(value);
-		}
-
-		void push_front(value_type&& value)
-		{
-			emplace_front(value);
-		}
-
-		template <class ... Args>
-		void emplace_front_without_checks(Args&& ... args)
-		{
-			--read_pos;
-			new (&read_ptr()) T(std::forward<Args>(args)...);
-		}
-
-		template <class ... Args>
-		bool try_emplace_front(Args&& ... args)
-		{
-			if (full())
-				return false;
-			emplace_front_without_checks(std::forward<Args>(args)...);
-		}
-
-		template <class ... Args>
-		void emplace_front(Args&& ... args)
-		{
-			if (full())
-				pop_back();
-			emplace_front_without_checks(std::forward<Args>(args)...);
-		}
-
-		template <class InputIterator>
-		void insert_front(InputIterator first, InputIterator last)
-		{
-			std::copy(first, last, std::front_inserter(*this));
-		}
-
-		/*
-		extraction methods
-		*/
-
-		/*
-		extract from the front of the buffer
-		used with back insertion to make a FIFO queue
+		pop front : removes elements from the begin of the buffer then advance the the front pointer
+		before the pop the front ptr points to the front object
+		after the pop the front ptr moves towards the back ptr to point to the next object which becomes the new front object
+		=====>
+		 front                                back
+		   ^                                   ^
+		   |                                   |
+		------------------------------------------------------------------------------
+		| >1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | < |  |  |  |  |  |  |  |  |  |  |  |  |
+		------------------------------------------------------------------------------
+		------>
+		   new front                        back
+			  ^                               ^
+			  |                               |
+		--------------------------------------------------------------------------
+		|  | >2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | < |  |  |  |  |  |  |  |  |  |  |  |
+		--------------------------------------------------------------------------
 		*/
 
 		void pop_front(value_type& value)
 		{
-			auto& elem = read_ptr();
-			value = std::move(elem);
-			elem.~T();
-			++read_pos;
+			assert(buffer_start != nullptr && "void ring_buffer<T>::pop_front(value_type& value) the ring buffer has no capacity");
+			assert(!empty() && "void ring_buffer<T>::pop_front(value_type& value) the ring buffer is empty");
+
+			value = std::move_if_noexcept(*front_ptr);
+			front_ptr->~T();
+			increment_front();
+		}
+
+		void pop_front()
+		{
+			assert(buffer_start != nullptr && "void ring_buffer<T>::pop_front() the ring buffer has no capacity");
+			assert(!empty() && "void ring_buffer<T>::pop_front() the ring buffer is empty");
+
+			front_ptr->~T();
+			increment_front();
 		}
 
 		bool try_pop_front(value_type& value)
@@ -407,13 +475,6 @@ class ring_buffer_index
 			if (empty())
 				return false;
 			pop_front(value);
-			return true;
-		}
-
-		void pop_front()
-		{
-			read_ptr().~T();
-			++read_pos;
 		}
 
 		bool try_pop_front()
@@ -421,67 +482,105 @@ class ring_buffer_index
 			if (empty())
 				return false;
 			pop_front();
-			return true;
 		}
 
-		// dumps num of first elements into dest where dest points to initialized memory
-		template <class OutputIterator>
-		void pop_front(OutputIterator dest, size_t num)
+		template <class OutputIter>
+		OutputIter pop_front(OutputIter first, OutputIter last)
 		{
-			move_from_front(dest, num);
-			if constexpr (std::is_pod_v<value_type>)
-				read_pos += num;
+			return pop_front(first, udistance(first, last));
+		}
+
+		template <class OutputIter>
+		OutputIter pop_front(OutputIter dest_first, size_type num)
+		{
+			num = std::min(num, size());
+			if (!num)
+				return dest_first;
+
+			count -= num;
+			OutputIter ret;
+
+			if (is_linearized())
+			{
+				ret = std::copy(std::make_move_iterator(front_ptr), std::make_move_iterator(front_ptr + num), dest_first);
+				std::destroy(front_ptr, front_ptr + num);
+				front_ptr += num;
+				return ret;
+			}
+
 			else
 			{
-				while (num--)
-					pop_front();
+				auto array1 = get_array<1, false>(false);
+				size_type num1 = std::min(num, array1.size());
+				ret = std::copy(std::make_move_iterator(array1.begin()), std::make_move_iterator(array1.begin() + num1), dest_first);
+				std::destroy(array1.begin(), array1.begin() + num1);
+
+				front_ptr += num1;
+				if (front_ptr == buffer_end)
+					front_ptr = buffer_start;
+
+				size_type rem = num - num1;
+				if (rem)
+				{
+					auto array2 = get_array<2, false>(false);
+					ret = std::copy(std::make_move_iterator(array2.begin()), std::make_move_iterator(array2.begin() + rem), ret);
+					std::destroy(array2.begin(), array2.begin() + rem);
+					front_ptr += rem;
+				}
 			}
-		}
 
-		// dumps num of first elements into dest where dest points to uninitialized memory
-		template <class OutputIterator>
-		void pop_front(OutputIterator dest, size_t num, no_init_t)
-		{
-			move_from_front(dest, num, no_init);
-			if constexpr (std::is_pod_v<value_type>)
-				read_pos += num;
-			else
-			{
-				while (num--)
-					pop_front();
-			}
+			return ret;
 		}
-
-		template <class OutputIterator>
-		bool try_pop_front(OutputIterator dest, size_t num)
-		{
-			if (num > size())
-				return false;
-			pop_front(dest, num);
-			return true;
-		}
-
-		template <class OutputIterator>
-		bool try_pop_front(OutputIterator dest, size_t num, no_init_t)
-		{
-			if (num > size())
-				return false;
-			pop_front(dest, num, no_init);
-			return true;
-		}
-
 
 		/*
-		extract from the back of the buffer
-		used with back insertion to make a LIFO queue
+		pop back : removes elements from the end of the buffer then decrement the back pointer
+		before the pop the back pointer points to the place past the last element (the place in which a new element would be inserted at the back)
+		after the pop the back pointer points to the place of the popped element
+
+		------------------------------------------------------------------
+		| =>1 | 2 | 3 | 4 | 5 | 6 | 7 | => |  |  |  |  |  |  |  |  |  |  |
+		--^-----------------------------^---------------------------------
+		  ^                             ^
+		 front                         back
+						<------------------
+		-----------------------------------------------------------------
+		| =>1 | 2 | 3 | 4 | 5 | 6 | => |  |  |  |  |  |  |  |  |  |  |  |
+		--^-------------------------^------------------------------------
+		  ^                         ^
+		 front                     new back
 		*/
 
 		void pop_back(value_type& value)
 		{
-			--write_pos;
-			auto& elem = write_ptr();
-			value = std::move(elem);
-			elem.~T();
+			assert(buffer_start != nullptr && "void ring_buffer<T>::pop_back(value_type& value) the ring buffer has no capacity");
+			assert(!empty() && "void ring_buffer<T>::pop_back(value_type& value) the ring buffer is empty");
+
+#ifdef __cpp_exceptions
+			try
+			{
+				decrement_back();
+				value = std::move_if_noexcept(*back_ptr);
+				back_ptr->~T();
+			}
+			catch (...)
+			{
+				increment_back();
+				throw;
+			}
+#else
+			decrement_back();
+			value = std::move_if_noexcept(*back_ptr);
+			back_ptr->~T();
+#endif // __cpp_exceptions
+			}
+
+		void pop_back() noexcept
+		{
+			assert(buffer_start != nullptr && "void ring_buffer<T>::pop_back() the ring buffer has no capacity");
+			assert(!empty() && "void ring_buffer<T>::pop_back() the ring buffer is empty");
+
+			decrement_back();
+			back_ptr->~T();
 		}
 
 		bool try_pop_back(value_type& value)
@@ -492,13 +591,7 @@ class ring_buffer_index
 			return true;
 		}
 
-		void pop_back()
-		{
-			--write_pos;
-			write_ptr().~T();
-		}
-
-		bool try_pop_back()
+		bool try_pop_back() noexcept
 		{
 			if (empty())
 				return false;
@@ -506,484 +599,638 @@ class ring_buffer_index
 			return true;
 		}
 
-		template <class OutputIterator>
-		void pop_back(OutputIterator dest, size_t num)
+		template <class OutputIter>
+		OutputIter pop_back(OutputIter first, OutputIter last)
 		{
-			move_from_back(dest, num);
-			if constexpr (std::is_pod_v<value_type>)
-				write_pos -= num;
-			else
-			{
-				while (num--)
-					pop_back();
-			}
-		}
-		
-		template <class OutputIterator>
-		void pop_back(OutputIterator dest, size_t num, no_init_t)
-		{
-			move_from_back(dest, num, no_init);
-			if constexpr (std::is_pod_v<value_type>)
-				write_pos -= num;
-			else
-			{
-				while (num--)
-					pop_back();
-			}
+			return pop_back(first, udistance(first, last));
 		}
 
-		template <class OutputIterator>
-		bool try_pop_back(OutputIterator dest, size_t num)
+		template <class OutputIter>
+		OutputIter pop_back(OutputIter dest_first, size_type num)
 		{
-			if (size() < num)
-				return false;
-			pop_back(dest, num);
-			return true;
-		}
+			num = std::min(num, size());
+			if (!num)
+				return dest_first;
 
-		template <class OutputIterator>
-		bool try_pop_back(OutputIterator dest, size_t num, no_init_t)
-		{
-			if (size() < num)
-				return false;
-			pop_back(dest, num, no_init);
-			return true;
+			count -= num;
+			OutputIter ret = dest_first;
+
+			if (is_linearized())
+			{
+				--back_ptr;
+				pointer end_copy_ptr = back_ptr;
+				back_ptr -= num;
+				ret = std::copy(std::make_move_iterator(back_ptr), std::make_move_iterator(end_copy_ptr), dest_first);
+				std::destroy(back_ptr, end_copy_ptr);
+			}
+
+			else
+			{
+				auto array2 = get_array<2, false>(false);
+				size_type num1 = std::min(num, array2.size());
+				size_type rem = num - num1;
+				if (rem)
+				{
+					auto array1 = get_array<1, false>(false);
+					auto start_copy_ptr = std::prev(array1.end(), rem);
+					ret = std::copy(std::make_move_iterator(start_copy_ptr), std::make_move_iterator(array1.end()), dest_first);
+					std::destroy(start_copy_ptr, array1.end());
+				}
+				auto start_copy_ptr = std::prev(array2.end(), num1);
+				ret = std::copy(std::make_move_iterator(start_copy_ptr), std::make_move_iterator(array2.end()), ret);
+				std::destroy(start_copy_ptr, array2.end());
+				decrement_by(back_ptr, num);
+			}
+
+			return ret;
 		}
 
 		/*
-		accesors
+		ranges
 		*/
 
-		reference front() { return read_ptr(); }
+		iterator begin() { return iterator{ this, !empty() ? front_ptr : nullptr }; }
 
-		reference back()
-		{
-			auto pos = write_pos;
-			--pos;
-			return raw_buffer[pos.as_index(N)];
-		}
+		const_iterator begin() const { return const_iterator{ this, !empty() ? front_ptr : nullptr }; }
 
-		const_reference front() const { return read_ptr(); }
+		const_iterator cbegin() const { return begin(); }
 
-		const_reference back() const
-		{
-			auto pos = write_pos;
-			--pos;
-			return raw_buffer[pos.as_index(N)];
-		}
+		iterator end() { return iterator{ this, nullptr }; }
 
-		reference operator[](size_type pos) noexcept
-		{
-			auto index = read_pos + pos;
-			return raw_buffer[index.as_index(N)];
-		}
+		const_iterator end() const { return const_iterator{ this, nullptr }; }
 
-		const_reference operator[](size_type pos) const noexcept
-		{
-			auto index = read_pos + pos;
-			return raw_buffer[index.as_index(N)];
-		}
+		const_iterator cend() const { return end(); }
+
+		reverse_iterator rbegin() { return reverse_iterator{ end() }; }
+
+		const_reverse_iterator rbegin() const { return const_reverse_iterator{ end() }; }
+
+		const_reverse_iterator crbegin() const { return rbegin(); }
+
+		reverse_iterator rend() { return reverse_iterator{ begin() }; }
+
+		const_reverse_iterator rend() const { return const_reverse_iterator{ begin() }; }
+
+		const_reverse_iterator crend() const { return rend(); }
 
 		/*
-		^ ==> read pointer
-		> ==> write pointer
-		data starts from read pointer to write pointer
+			^ ==> front pointer
+			> ==> back pointer
+			data starts from front pointer to back pointer
 
-		1 - linearized (from empty to full) : there is one array starting from read pointer to write pointer
-		--------------------------------------------------------------------------
-		| ^ | 1 | 2 | 3 | 4 | 5 | > |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-		--------------------------------------------------------------------------
+			1 - linearized : there is one array starting from front pointer to back pointer
+			--------------------------------------------------------------------------
+			| =>1 | 2 | 3 | 4 | 5 | => |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+			---^--------------------^-------------------------------------------------
+			   ^                    ^
+			   front               back
 
-		2 - not linearized :
-		the first array is from read pointer until the end of the buffer (last index N-1)
-		the second array is from the start of the buffer until the write pointer
-		--------------------------------------------------------------------------------------
-		| 6 | 7 | 8 | > |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ^ | 1 | 2 | 3 | 4 | 5 |  
-		--------------------------------------------------------------------------------------
-		*/
+			2 - not linearized :
+			the first array is from front pointer until the end of the buffer (last index N-1)
+			the second array is from the start of the buffer until the back pointer
+			----------------------------------------------------------------------------------------
+			| 6 | 7 | 8 | => |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | =>1 | 2 | 3 | 4 | 5 |
+			--------------^-----------------------------------------------------^-------------------
+						  ^                                                     ^
+						  ^                                                     ^
+						 back                                                  front
+			*/
+
+		template <size_t OneOrTwo, bool const_array>
+		std::span<std::conditional_t<const_array, const value_type, value_type>> get_array(bool is_buffer_linearized) const noexcept
+		{
+			static_assert((OneOrTwo == 1 || OneOrTwo == 2), " wrong array !!!");
+			assert(buffer_start != nullptr && "the ring buffer has no capacity");
+
+			if constexpr (OneOrTwo == 1)
+			{
+				if (is_buffer_linearized)
+					return { front_ptr, front_ptr + size() };
+				else
+					return { front_ptr, udistance(front_ptr, buffer_end) };
+			}
+
+			else
+			{
+				if (is_buffer_linearized)
+					return {};
+				else
+					return { buffer_start, back_ptr };
+			}
+		}
 
 		std::span<value_type> array_one() noexcept
 		{
-			pointer read_pointer = &read_ptr();
-			if (is_linearized()) // or empty
-				return std::span<value_type>{read_pointer, read_pointer + size()};
-			else
-				return std::span<value_type>{read_pointer, raw_buffer.ptr() - read_pointer + size()};
+			return get_array<1, false>(is_linearized());
 		}
 
 		std::span<const value_type> array_one() const noexcept
 		{
-			pointer read_pointer = &read_ptr();
-			if (is_linearized()) // or empty
-				return std::span<const value_type>{read_pointer, read_pointer + size()};
-			else
-				return std::span<const value_type>{read_pointer, raw_buffer.ptr() - read_pointer + size()};
+			return get_array<1, true>(is_linearized());
 		}
 
 		std::span<value_type> array_two() noexcept
 		{
-			if (is_linearized())
-				return {};
-			else
-			{
-				return std::span<value_type>{raw_buffer.ptr(), &write_ptr()};
-			}
+			return get_array<2, false>(is_linearized());
 		}
 
 		std::span<const value_type> array_two() const noexcept
 		{
-			if (is_linearized())
-				return {};
-			else
-			{
-				return std::span<const value_type>{raw_buffer.ptr(), &write_ptr()};
-			}
+			return get_array<2, true>(is_linearized());
 		}
-
-		void copy_from_front(value_type& value) const
-		{
-			value = front();
-		}
-
-		value_type copy_from_front() const
-		{
-			value_type value;
-			copy_from_front(value);
-			return value;
-		}
-
-		void move_from_front(value_type& value)
-		{
-			value = std::move(front());
-		}
-
-		value_type move_from_front()
-		{
-			value_type value;
-			move_from_front(value);
-			return value;
-		}
-
-		template <class OutputIterator>
-		void copy_from_front(OutputIterator dest, size_t num) const
-		{
-			if (is_linearized())
-			{
-				pointer begin_iter = &read_ptr();
-				pointer end_iter = begin_iter + num;
-				std::copy(begin_iter, end_iter, dest);
-			}
-			else
-			{
-				auto begin_iter = begin();
-				auto end_iter = begin_iter + num;
-				std::copy(begin_iter, end_iter, dest);
-			}
-		}
-
-		template <class OutputIterator>
-		void copy_from_front(OutputIterator dest, size_t num, no_init_t) const
-		{
-			if (is_linearized())
-			{
-				pointer begin_iter = &read_ptr();
-				pointer end_iter = begin_iter + num;
-				std::uninitialized_copy(begin_iter, end_iter, dest);
-			}
-			else
-			{
-				auto begin_iter = begin();
-				auto end_iter = begin_iter + num;
-				std::uninitialized_copy(begin_iter, end_iter, dest);
-			}
-		}
-
-		template <class OutputIterator>
-		void move_from_front(OutputIterator dest, size_t num)
-		{
-			if (is_linearized())
-			{
-				pointer begin_iter = &read_ptr();
-				pointer end_iter = begin_iter + num;
-				std::copy(std::make_move_iterator(begin_iter), std::make_move_iterator(end_iter), dest);
-			}
-			else
-			{
-				auto begin_iter = begin();
-				auto end_iter = begin_iter + num;
-				std::copy(std::make_move_iterator(begin_iter), std::make_move_iterator(end_iter), dest);
-			}
-		}
-
-		template <class OutputIterator>
-		void move_from_front(OutputIterator dest, size_t num, no_init_t)
-		{
-			if (is_linearized())
-			{
-				pointer begin_iter = &read_ptr();
-				pointer end_iter = begin_iter + num;
-				std::uninitialized_move(begin_iter, end_iter, dest);
-			}
-			else
-			{
-				auto begin_iter = begin();
-				auto end_iter = begin_iter + num;
-				std::uninitialized_move(begin_iter, end_iter, dest);
-			}
-		}
-
-		void copy_from_back(value_type& value) const
-		{
-			value = back();
-		}
-
-		value_type copy_from_back() const
-		{
-			value_type value;
-			copy_from_back(value);
-			return value;
-		}
-
-		void move_from_back(value_type& value)
-		{
-			value = std::move(back());
-		}
-
-		value_type move_from_back()
-		{
-			value_type value;
-			move_from_back(value);
-			return value;
-		}
-
-		template <class OutputIterator>
-		void copy_from_back(OutputIterator dest, size_t num) const
-		{
-			if (is_linearized())
-			{
-				pointer end_iter = &write_ptr();
-				pointer first = end_iter - num;
-				std::copy(first, end_iter, dest);
-			}
-			else
-			{
-				auto end_iter = end();
-				auto first = end_iter - num;
-				std::copy(first, end_iter, dest);
-			}
-		}
-
-		template <class OutputIterator>
-		void copy_from_back(OutputIterator dest, size_t num, no_init_t) const
-		{
-			if (is_linearized())
-			{
-				pointer end_iter = &write_ptr();
-				pointer first = end_iter - num;
-				std::uninitialized_copy(first, end_iter, dest);
-			}
-			else
-			{
-				auto end_iter = end();
-				auto first = end_iter - num;
-				std::uninitialized_copy(first, end_iter, dest);
-			}
-		}
-
-		template <class OutputIterator>
-		void move_from_back(OutputIterator dest, size_t num)
-		{
-			if (is_linearized())
-			{
-				pointer end_iter = &write_ptr();
-				pointer first = end_iter - num;
-				std::copy(std::make_move_iterator(first), std::make_move_iterator(end_iter), dest);
-			}
-			else
-			{
-				auto end_iter = end();
-				auto first = end_iter - num;
-				std::copy(std::make_move_iterator(first), std::make_move_iterator(end_iter), dest);
-			}
-		}
-
-		template <class OutputIterator>
-		void move_from_back(OutputIterator dest, size_t num, no_init_t)
-		{
-			if (is_linearized())
-			{
-				pointer end_iter = &write_ptr();
-				pointer first = end_iter - num;
-				std::uninitialized_move(first, end_iter, dest);
-			}
-			else
-			{
-				auto end_iter = end();
-				auto first = end_iter - num;
-				std::uninitialized_move(first, end_iter, dest);
-			}
-		}
-
-		/*
-		range methods
-		*/
-
-		iterator begin() noexcept { return iterator{raw_buffer.ptr(), read_pos, N}; }
-
-		iterator end() noexcept { return iterator{raw_buffer.ptr(), write_pos, N}; }
-
-		const_iterator begin() const noexcept { return const_iterator{raw_buffer.ptr(), read_pos, N}; }
-
-		const_iterator end() const noexcept { return const_iterator{raw_buffer.ptr(), write_pos, N}; }
-
-		const_iterator cbegin() const noexcept { return begin(); }
-
-		const_iterator cend() const noexcept { return end(); }
-
-		reverse_iterator rbegin() noexcept { return reverse_iterator{ raw_buffer.ptr(), write_pos - 1, N }; }
-
-		reverse_iterator rend() noexcept { return reverse_iterator{ raw_buffer.ptr(), read_pos - 1, N }; }
-
-		const_reverse_iterator rbegin() const noexcept { return const_reverse_iterator{ raw_buffer.ptr(), write_pos - 1, N }; }
-
-		const_reverse_iterator rend() const noexcept { return const_reverse_iterator{ raw_buffer.ptr(), read_pos - 1, N }; }
-
-		const_reverse_iterator crbegin() const noexcept { return rbegin(); }
-
-		const_reverse_iterator crend() const noexcept { return rend(); }
 
 
 		/*
-		eraser, linearization, resize and some info
+		accessors
 		*/
 
-		void clear()
+		reference front() noexcept
 		{
-			if constexpr (std::is_pod_v<value_type>)
-			{
-				read_pos.reset();
-				write_pos.reset();
-			}
-			else
-			{
-				while (!empty())
-					pop_front();
-			}
+			assert(buffer_start != nullptr && "reference ring_buffer<T>::front() noexcept : the ring buffer has no capacity");
+			assert(!empty() && "reference ring_buffer<T>::front() noexcept : the ring buffer is empty()");
+
+			return *front_ptr;
 		}
+
+		const_reference front() const noexcept
+		{
+			assert(buffer_start != nullptr && "const_reference ring_buffer<T>::front() const noexcept : the ring buffer has no capacity");
+			assert(!empty() && "const_reference ring_buffer<T>::front() const noexcept : the ring buffer is empty()");
+
+			return *front_ptr;
+		}
+
+		reference back()
+		{
+			assert(buffer_start != nullptr && "reference ring_buffer<T>::back() the ring buffer has no capacity");
+			assert(!empty() && "reference ring_buffer<T>::back() : the ring buffer is empty()");
+
+			pointer last_elem = back_ptr;
+			decrement(last_elem);
+			return *last_elem;
+		}
+
+		const_reference back() const noexcept
+		{
+			assert(buffer_start != nullptr && "const_reference ring_buffer<T>::back() const noexcept : the ring buffer has no capacity");
+			assert(!empty() && "const_reference ring_buffer<T>::back() const noexcept : the ring buffer is empty()");
+
+			pointer last_elem = back_ptr;
+			decrement(last_elem);
+			return *last_elem;
+		}
+
+		reference operator[](size_type index) noexcept
+		{
+			assert(buffer_start != nullptr && "reference ring_buffer<T>::operator[](size_type index) noexcept : the ring buffer has no capacity");
+			assert(index >= 0 && index < size() && "reference ring_buffer<T>::operator[](size_type index) noexcept : index out of range");
+
+			pointer ptr = front_ptr;
+			increment_by(ptr, index);
+			return *ptr;
+		}
+
+		const_reference operator[](size_type index) const
+		{
+			assert(buffer_start != nullptr && "const_reference ring_buffer<T>::operator[](size_type index) const the ring buffer has no capacity");
+			assert(index >= 0 && index < size() && "const_reference ring_buffer<T>::operator[](size_type index) const noexcept : index out of range");
+
+			pointer ptr = front_ptr;
+			increment_by(ptr, index);
+			return *ptr;
+		}
+
+		/*
+		modifiers
+		*/
+
 
 		pointer linearize()
 		{
-			ring_buffer rbf(N);
-			auto first_array = array_one();
-			rbf.insert_back(std::make_move_iterator(first_array.begin()), std::make_move_iterator(first_array.end()));
-			auto second_array = array_two();
-			rbf.insert_back(std::make_move_iterator(second_array.begin()), std::make_move_iterator(second_array.end()));
-			this->operator=(std::move(rbf));
-			return raw_buffer.ptr();
+
+			assert(buffer_start != nullptr && "the ring buffer has no capacity");
+
+			if (empty())
+				return nullptr;
+
+			else if (is_linearized())
+				return front_ptr;
+
+			auto array1 = array_one();
+			auto array2 = array_two();
+
+			auto it1 = array1.begin();
+			auto it2 = array2.begin();
+			auto end1 = array1.end();
+			auto end2 = array2.end();
+
+			if (array1.size() > array2.size())
+			{
+				// initizalize the uninitialized memory
+				auto free_mem = reserve();
+				for (auto& uninit : slice(end2, end2 + free_mem))
+					new (&uninit) T();
+
+				// shift the free mem to the most back of the buff
+				std::rotate(end2, it1, end1);
+
+				// uninitizalize the initialized  free memory
+				for (auto& inited : slice(buffer_end - free_mem, buffer_end))
+					inited.~T();
+
+				// swap array2 with first elements of array1
+
+				auto array2_size = array2.size();
+				auto rit1 = buffer_end - array2_size;
+
+				while (1)
+				{
+					std::swap_ranges(it2, end2, rit1);
+					rit1 -= array2_size;
+					if (rit1 < it1)
+					{
+						rit1 += array2_size;
+						break;
+					}
+				}
+
+				// shift the front to the most front of the buffer
+				std::rotate(it2, it1, rit1);
+
+			}
+
+			else if (array2.size() > array1.size())
+			{
+
+				// swap array1 with first elements of array2
+
+				auto array1_size = array1.size();
+				while (array1_size >= static_cast<size_t>(std::distance(it2, array2.end())))
+					it2 = std::swap_ranges(it1, end1, it2);
+
+				// initizalize the uninitialized memory
+				auto free_mem = reserve();
+				for (auto& uninit : slice(end2, end2 + free_mem))
+					new (&uninit) T();
+
+				// shift the back and previously uninitialzed memeory to the most back
+				std::rotate(it2, it1, array1.end());
+
+				// uninitizalize the initialized  free memory
+				for (auto& inited : slice(end2, end2 + free_mem))
+					inited.~T();
+
+			}
+
+			front_ptr = buffer_start;
+			back_ptr = front_ptr + size();
+
+			return buffer_start;
 		}
 
-		template <class OutputIterator>
-		void linearize(OutputIterator dest) const
+		void swap(ring_buffer& other) noexcept
 		{
-			auto first_array = array_one();
-			std::copy(first_array.begin(), first_array.end(), dest);
-			auto second_array = array_two();
-			std::copy(second_array.begin(), second_array.end(), dest + first_array.size());
+			using std::swap;
+			swap(buffer_start, other.buffer_start);
+			swap(buffer_end, other.buffer_end);
+			swap(front_ptr, other.front_ptr);
+			swap(back_ptr, other.back_ptr);
+			swap(count, other.count);
 		}
 
-		void set_capacity(size_type Num)
+		void clear()
 		{
-			clear();
-			N = Num;
-			raw_buffer.resize(Num);
+			assert(buffer_start != nullptr && "the ring buffer has no capacity");
+			DestroyAll();
+			front_ptr = back_ptr = buffer_start;
+			count = 0;
 		}
 
-		size_t capacity() const noexcept { return N; }
-
-		size_t size() const noexcept { return write_pos - read_pos; }
-
-		size_t available_size() const noexcept { return capacity() - size(); }
-
-		size_t reserve() const noexcept { return available_size(); }
-
-		bool full() const noexcept { return size() == capacity(); }
-
-		bool empty() const noexcept { return !size(); }
-
-		bool is_linearized() const noexcept 
+		void set_capacity(size_type capacity_size)
 		{
-			ring_buffer_index last_pos = write_pos - 1;
-			return last_pos.as_index(N) >= read_pos.as_index(N);
+			this->~ring_buffer();
+			new (this) ring_buffer(capacity_size);
+		}
+
+		void resize(size_type new_size, const value_type& value = value_type())
+		{
+			auto current_cap = buffer_start ? capacity() : 0;
+
+			if (new_size > current_cap)
+			{
+				size_type oldsize = size();
+				auto temp_buffer = std::move(*this);
+				set_capacity(new_size);
+				
+				bool linearized = is_linearized();
+				auto array1 = temp_buffer.get_array<1, false>(linearized);
+				auto array2 = temp_buffer.get_array<2, false>(linearized);
+				back_ptr = std::uninitialized_copy(std::make_move_iterator(array1.begin()), std::make_move_iterator(array1.end()), buffer_start);
+				back_ptr = std::uninitialized_copy(std::make_move_iterator(array2.begin()), std::make_move_iterator(array2.end()), back_ptr);
+
+				std::uninitialized_fill(back_ptr, buffer_end, value);
+				back_ptr = buffer_start;
+				count = new_size;
+			}
+
+			else if (new_size < current_cap)
+			{
+				if (size() > new_size)
+				{
+					while (size() > new_size)
+						pop_back();
+				}
+				else
+				{
+					while (size() < new_size)
+						emplace_back_without_checks(value);
+				}
+			}
+
+			else
+			{
+				while (!full())
+					emplace_back_without_checks(T());
+			}
 		}
 
 		/*
-		aliases to use the ring buffer as FIFO
+		info
 		*/
 
-		template <class ...Args>
-		void emplace(Args&& ... args)
+		constexpr size_type size() const noexcept { assert(buffer_start != nullptr && "the ring buffer has no capacity"); return count; }
+
+		constexpr size_type capacity() const noexcept { assert(buffer_start != nullptr && "the ring buffer has no capacity"); return udistance(buffer_start, buffer_end); }
+
+		constexpr size_type reserve() const noexcept { return capacity() - size(); }
+
+		constexpr bool empty() const noexcept { return !size(); }
+
+		constexpr bool full() const noexcept { return size() == capacity(); }
+
+		constexpr bool is_linearized() const noexcept { assert(buffer_start != nullptr && "the ring buffer has no capacity"); return back_ptr > front_ptr || back_ptr == buffer_start; }
+
+		Allocator& get_allocator() noexcept
 		{
-			emplace_back(std::forward<Args>(args)...);
+			return static_cast<Allocator&>(*this);
 		}
 
-		void push(const value_type& value)
+		const Allocator& get_allocator() const noexcept
 		{
-			push_back(value);
+			return static_cast<const Allocator&>(*this);
 		}
 
-		void push(value_type&& value)
+		friend bool operator==(const ring_buffer& lhs, const ring_buffer& rhs)
 		{
-			push_back(std::move(value));
+			auto first1 = rhs.begin();
+			auto last1 = rhs.end();
+			auto first2 = lhs.begin();
+
+			while (first1 != last1)
+			{
+				if (*first1++ != *first2++)
+					return false;
+			}
+
+			return true;
 		}
 
-		template <class InputIterator>
-		void insert(InputIterator first, InputIterator last)
+		friend bool operator!=(const ring_buffer& lhs, const ring_buffer& rhs)
 		{
-			insert_back(first, last);
+			return !(lhs == rhs);
 		}
 
-		void pop(value_type& value)
+	private:
+
+		pointer buffer_start;
+		pointer buffer_end;
+
+		pointer front_ptr;
+		pointer back_ptr;
+
+		size_type count;
+
+		template <typename, typename, bool> friend class ring_buffer_iterator;
+
+		void increment(pointer& ptr) const
 		{
-			pop_front(value);
+			if (++ptr == buffer_end)
+				ptr = buffer_start;
 		}
 
-		bool try_pop(value_type& value)
+		void increment_by(pointer& ptr, difference_type n) const
 		{
-			return try_pop_front(value);
+			ptr = buffer_start + ((buffer_end - ptr + n) % capacity());
 		}
 
-		void pop()
+		void decrement(pointer& ptr) const
 		{
-			pop_front();
+			if (ptr == buffer_start)
+				ptr = buffer_end;
+			--ptr;
 		}
 
-		bool try_pop()
+		void decrement_by(pointer& ptr, difference_type n) const { increment_by(ptr, -n); }
+
+		// push_back
+		void increment_back() noexcept
 		{
-			return try_pop_front();
+			if (++back_ptr == buffer_end)
+				back_ptr = buffer_start;
+			++count;
 		}
 
-		template <class OutputIt>
-		void pop(OutputIt dest, size_t num)
+		// pop_front
+		void increment_front() noexcept
 		{
-			pop_front(dest, num);
+			if (++front_ptr == buffer_end)
+				front_ptr = buffer_start;
+			--count;
 		}
 
-		template <class OutputIt>
-		void pop(OutputIt dest, size_t num, no_init_t)
+		// pop_back
+		void decrement_back() noexcept
 		{
-			pop_front(dest, num, no_init);
+			if (back_ptr == buffer_start)
+				back_ptr = buffer_end;
+			--back_ptr;
+			--count;
 		}
 
-		template <class OutputIt>
-		bool try_pop(OutputIt dest, size_t num)
+		// push_front
+		void decrement_front() noexcept
 		{
-			return try_pop_front(dest, num);
+			if (front_ptr == buffer_start)
+				front_ptr = buffer_end;
+			--front_ptr;
+			++count;
 		}
 
-		template <class OutputIt>
-		bool try_pop(OutputIt dest, size_t num, no_init_t)
+		template <class Iter>
+		size_type udistance(Iter first, Iter last) const
 		{
-			return try_pop_front(dest, num, no_init);
+			return static_cast<size_type>(std::distance(first, last));
 		}
+
+		pointer AllocMem(size_type n)
+		{
+			return alloc_traits::allocate(get_allocator(), n);;
+		}
+
+		void FreeMem(pointer Block)
+		{
+			alloc_traits::deallocate(get_allocator(), Block, 1);
+		}
+
+		template <class ... Args>
+		void Construct(pointer Ptr, Args && ... args)
+		{
+			alloc_traits::construct(get_allocator(), Ptr, std::forward<Args>(args)...);
+		}
+
+		void DestroyAll()
+		{
+			if constexpr (!std::is_pod_v<value_type>)
+			{
+				bool linearized = is_linearized();
+				auto array1 = get_array<1, false>(linearized);
+				auto array2 = get_array<2, false>(linearized);
+				std::destroy(array1.begin(), array1.end());
+				std::destroy(array2.begin(), array2.end());
+			}
+		}
+
+		};
+
+	template <class T, std::size_t N>
+	class stack_ring_buffer : public ring_buffer<T, StackAllocator<T, N>>
+	{
+		using base = ring_buffer<T, StackAllocator<T, N>>;
+	public:
+
+		PROVIDE_CONTAINER_TYPES(base);
+
+		stack_ring_buffer() noexcept : base(N) {}
+
+		stack_ring_buffer(const stack_ring_buffer& other) : base(other) {}
+
+		stack_ring_buffer(stack_ring_buffer&& other) noexcept : stack_ring_buffer()
+		{
+			std::uninitialized_move(other.begin(), other.end(), std::back_inserter(*this));
+		}
+
+		template <class InputIter>
+		stack_ring_buffer(InputIter first, InputIter last) : base(first, last) {}
+
+		stack_ring_buffer& operator=(const stack_ring_buffer& other)
+		{
+			base::operator=(other);
+			return *this;
+		}
+
+		stack_ring_buffer& operator=(stack_ring_buffer&& other) noexcept
+		{
+			base::~ring_buffer();
+			new (this) stack_ring_buffer(std::move(other));
+			return *this;
+		}
+
+		void set_capacity(size_type) = delete;
+
+		void resize(size_type) = delete;
 
 	};
+
+	template <class T, class Allocator, bool is_const>
+	inline auto ring_buffer_iterator<T, Allocator, is_const>::operator*() const noexcept -> std::conditional_t<is_const, const_reference, reference>
+	{
+		assert(ptr != nullptr && "ring_buffer_iterator::operator*() derefrencing null iterator");
+#ifdef _DEBUG
+		if (!rbf_ptr->full())
+		{
+			if (rbf_ptr->is_linearized())
+				assert(ptr >= rbf_ptr->front_ptr && ptr < rbf_ptr->back_ptr && "the iterator is out of range");
+			else
+			{
+				auto array1 = rbf_ptr->array_one();
+				auto array2 = rbf_ptr->array_two();
+				assert((ptr >= array1.end() && ptr < array1.end()) || (ptr >= array2.end() && ptr < array2.end()) && "the iterator is out of range");
+			}
+		}
+#endif // _DEBUG
+		return *ptr;
+	}
+
+	template <class T, class Allocator, bool is_const>
+	inline ring_buffer_iterator<T, Allocator, is_const>& ring_buffer_iterator<T, Allocator, is_const>::operator++() noexcept
+	{
+		rbf_ptr->increment(ptr);
+
+		if (ptr == rbf_ptr->back_ptr)
+			ptr = nullptr;
+
+		return *this;
+	}
+
+	template <class T, class Allocator, bool is_const>
+	inline ring_buffer_iterator<T, Allocator, is_const>& ring_buffer_iterator<T, Allocator, is_const>::operator--() noexcept
+	{
+		if (ptr == nullptr) // for --end(), std::prev(end()) which is used with reverse iterator
+			ptr = rbf_ptr->back_ptr;
+
+		rbf_ptr->decrement(ptr);
+
+		return *this;
+	}
+
+	template<class T, class Allocator, bool is_const>
+	inline auto ring_buffer_iterator<T, Allocator, is_const>::operator-(const ring_buffer_iterator & other) const noexcept -> difference_type
+	{
+		// convert pointer to index
+		auto make_linear_pointer = [&](pointer ptr) -> pointer
+		{
+			if (this->rbf_ptr->is_linearized())
+				return ptr;
+			else
+			{
+				if (ptr >= rbf_ptr->front_ptr && ptr < rbf_ptr->buffer_end)
+					return ptr;
+				else
+					return ptr + (rbf_ptr->buffer_end - rbf_ptr->front_ptr);
+			}
+		};
+		return make_linear_pointer(ptr) - make_linear_pointer(other.ptr);
+	}
+
+	template <class T, class Allocator, bool is_const>
+	inline ring_buffer_iterator<T, Allocator, is_const>& ring_buffer_iterator<T, Allocator, is_const>::operator+=(typename ring_buffer_iterator::difference_type n) noexcept
+	{
+		rbf_ptr->increment_by(ptr, n);
+
+		if (ptr == rbf_ptr->back_ptr)
+			ptr = nullptr;
+
+		return *this;
+	}
+
+	template <class T, class Allocator, bool is_const>
+	inline ring_buffer_iterator<T, Allocator, is_const>& ring_buffer_iterator<T, Allocator, is_const>::operator-=(typename ring_buffer_iterator::difference_type n) noexcept
+	{
+		if (ptr == nullptr)
+			ptr = rbf_ptr->back_ptr;
+
+		rbf_ptr->decrement_by(ptr, n);
+
+		return *this;
+	}
+
+};
+
+namespace std
+{
+	template <class T, class Allocator>
+	inline void swap(LIB_NAMESPACE::ring_buffer<T, Allocator>& lhs, LIB_NAMESPACE::ring_buffer<T, Allocator>& rhs) noexcept
+	{
+		lhs.swap(rhs);
+	}
+};
