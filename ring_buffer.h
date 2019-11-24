@@ -156,7 +156,7 @@ namespace LIB_NAMESPACE
 			assert(buffer_start != nullptr && "the ring buffer couldn't allocate memory");
 			if (back_ptr == buffer_end)
 				back_ptr = buffer_start;
-			std::uninitialized_fill(front_ptr, front_ptr + size, value);
+			std::uninitialized_fill(front_ptr, front_ptr + size(), value);
 		}
 
 		ring_buffer(size_type capacity_size, size_type buffer_size, const value_type& value, const allocator_type& alloc) : allocator_type(alloc),
@@ -193,7 +193,7 @@ namespace LIB_NAMESPACE
 				back_ptr = buffer_start + (other.back_ptr - other.buffer_start);
 
 				if (is_linearized())
-					std::uninitialized_copy(other.front_ptr, other.back_ptr, front_ptr);
+					std::uninitialized_copy(other.front_ptr, other.front_ptr + size(), front_ptr);
 				else
 				{
 					auto array1 = get_array<1, true>(false);
@@ -273,7 +273,7 @@ namespace LIB_NAMESPACE
 				throw;
 			}
 #else
-			new (back_ptr) T(std::forward<Args>(args)...);
+			Construct(back_ptr, std::forward<Args>(args)...);
 			increment_back();
 #endif // __cpp_exceptions
 			}
@@ -455,13 +455,27 @@ namespace LIB_NAMESPACE
 		{
 			assert(buffer_start != nullptr && "void ring_buffer<T>::pop_front(value_type& value) the ring buffer has no capacity");
 			assert(!empty() && "void ring_buffer<T>::pop_front(value_type& value) the ring buffer is empty");
-
+#ifdef __cpp_exceptions
+			try
+			{
+				pointer current_front = front_ptr;
+				increment_front();
+				value = std::move_if_noexcept(*current_front);
+				current_front->~T();
+			}
+			catch (...)
+			{
+				decrement_front();
+				throw;
+			}
+#else
 			value = std::move_if_noexcept(*front_ptr);
 			front_ptr->~T();
 			increment_front();
+#endif // __cpp_exceptions
 		}
 
-		void pop_front()
+		void pop_front() noexcept
 		{
 			assert(buffer_start != nullptr && "void ring_buffer<T>::pop_front() the ring buffer has no capacity");
 			assert(!empty() && "void ring_buffer<T>::pop_front() the ring buffer is empty");
@@ -475,13 +489,15 @@ namespace LIB_NAMESPACE
 			if (empty())
 				return false;
 			pop_front(value);
+			return true;
 		}
 
-		bool try_pop_front()
+		bool try_pop_front() noexcept
 		{
 			if (empty())
 				return false;
 			pop_front();
+			return true;
 		}
 
 		template <class OutputIter>
@@ -505,7 +521,8 @@ namespace LIB_NAMESPACE
 				ret = std::copy(std::make_move_iterator(front_ptr), std::make_move_iterator(front_ptr + num), dest_first);
 				std::destroy(front_ptr, front_ptr + num);
 				front_ptr += num;
-				return ret;
+				if (front_ptr == buffer_end)
+					front_ptr = buffer_start;
 			}
 
 			else
@@ -617,7 +634,7 @@ namespace LIB_NAMESPACE
 
 			if (is_linearized())
 			{
-				--back_ptr;
+				decrement(back_ptr);
 				pointer end_copy_ptr = back_ptr;
 				back_ptr -= num;
 				ret = std::copy(std::make_move_iterator(back_ptr), std::make_move_iterator(end_copy_ptr), dest_first);
